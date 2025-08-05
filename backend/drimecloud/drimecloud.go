@@ -66,62 +66,6 @@ type FileEntry struct {
 	UpdatedAt string `json:"updated_at"`
 }
 
-// FileEntry represents a file or folder from Drime API
-// type FileEntry struct {
-// 	ID          int64   `json:"id"`
-// 	Name        string  `json:"name"`
-// 	FileName    string  `json:"file_name"`
-// 	FileSize    int64   `json:"file_size"`
-// 	ParentID    *int64  `json:"parent_id"`
-// 	Parent      string  `json:"parent"`
-// 	Thumbnail   string  `json:"thumbnail"`
-// 	Mime        string  `json:"mime"`
-// 	URL         string  `json:"url"`
-// 	Hash        string  `json:"hash"`
-// 	Type        string  `json:"type"`
-// 	Description string  `json:"description"`
-// 	DeletedAt   *string `json:"deleted_at"`
-// 	CreatedAt   string  `json:"created_at"`
-// 	UpdatedAt   string  `json:"updated_at"`
-// 	Path        string  `json:"path"`
-// }
-
-// type FileEntry struct {
-// 	ID           int64           `json:"id"`
-// 	Name         string          `json:"name"`
-// 	Description  *string         `json:"description"`
-// 	FileName     string          `json:"file_name"`
-// 	Mime         string          `json:"mime"`
-// 	Color        *string         `json:"color"`
-// 	Backup       bool            `json:"backup"`
-// 	Tracked      int             `json:"tracked"`
-// 	FileSize     int64           `json:"file_size"`
-// 	UserID       *int64          `json:"user_id"`
-// 	ParentID     *int64          `json:"parent_id"`
-// 	CreatedAt    string          `json:"created_at"`
-// 	UpdatedAt    string          `json:"updated_at"`
-// 	DeletedAt    *string         `json:"deleted_at"`
-// 	Path         string          `json:"path"`
-// 	DiskPrefix   string          `json:"disk_prefix"`
-// 	Type         string          `json:"type"`
-// 	Extension    string          `json:"extension"`
-// 	FileHash     *string         `json:"file_hash"`
-// 	Public       bool            `json:"public"`
-// 	Thumbnail    bool            `json:"thumbnail"`     // Boolean indicating if thumbnail exists
-// 	ThumbnailURL *string         `json:"thumbnail_url"` // Nullable URL to thumbnail
-// 	MuxStatus    string          `json:"mux_status"`
-// 	WorkspaceID  int64           `json:"workspace_id"`
-// 	IsEncrypted  int             `json:"is_encrypted"`
-// 	IV           *string         `json:"iv"`
-// 	VaultID      *int64          `json:"vault_id"`
-// 	OwnerID      int64           `json:"owner_id"`
-// 	Hash         string          `json:"hash"`
-// 	URL          string          `json:"url"`
-// 	Users        []User          `json:"users"`
-// 	Tags         []interface{}   `json:"tags"` // Could be more specific if you know the tag structure
-// 	Permissions  map[string]bool `json:"permissions"`
-// }
-
 // APIResponse represents standard API response
 type APIResponse struct {
 	Status    string      `json:"status"`
@@ -160,15 +104,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root:   root,
 		opt:    *opt,
 		client: client,
-	}
-
-	// Find root folder ID if root path is specified
-	if root != "" {
-		rootID, err := f.findFolderByPath(ctx, root)
-		if err != nil {
-			return nil, fmt.Errorf("failed to find root folder: %w", err)
-		}
-		f.rootID = rootID
+		rootID: nil, // Always start with null root_id
 	}
 
 	return f, nil
@@ -242,38 +178,6 @@ func (f *Fs) Features() *fs.Features {
 	}
 }
 
-// findFolderByPath finds a folder ID by its path
-func (f *Fs) findFolderByPath(ctx context.Context, folderPath string) (*int64, error) {
-	if folderPath == "" || folderPath == "/" {
-		return nil, nil // Root folder
-	}
-
-	parts := strings.Split(strings.Trim(folderPath, "/"), "/")
-	var currentParentID *int64
-
-	for _, part := range parts {
-		entries, err := f.listEntries(ctx, currentParentID, "folder")
-		if err != nil {
-			return nil, err
-		}
-
-		found := false
-		for _, entry := range entries {
-			if entry.Name == part && entry.Type == "folder" {
-				currentParentID = &entry.ID
-				found = true
-				break
-			}
-		}
-
-		if !found {
-			return nil, fmt.Errorf("folder not found: %s", part)
-		}
-	}
-
-	return currentParentID, nil
-}
-
 // listEntries lists entries in a folder
 type PaginatedResponse struct {
 	CurrentPage int         `json:"current_page"`
@@ -331,14 +235,12 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 
 	// Create folder structure if needed
 	dir := path.Dir(remote)
-	var parentID *int64
+	var parentID *int64 = nil // Start from root
 	if dir != "." && dir != "" {
 		parentID, err = f.ensureFolderPath(ctx, dir)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create folder structure: %w", err)
 		}
-	} else {
-		parentID = f.rootID
 	}
 
 	// Create multipart form body
@@ -408,11 +310,11 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 // ensureFolderPath creates folder structure and returns the final folder ID
 func (f *Fs) ensureFolderPath(ctx context.Context, folderPath string) (*int64, error) {
 	if folderPath == "" || folderPath == "." {
-		return f.rootID, nil
+		return nil, nil // Root is always null
 	}
 
 	parts := strings.Split(strings.Trim(folderPath, "/"), "/")
-	currentParentID := f.rootID
+	var currentParentID *int64 = nil // Always start from root (null)
 
 	for _, part := range parts {
 		// Check if folder already exists
@@ -477,15 +379,14 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // List lists the objects and directories in dir
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	var parentID *int64
+	var parentID *int64 = nil // Start from root
 
+	// If we have a directory path, traverse to find its ID
 	if dir != "" {
-		parentID, err = f.findFolderByPath(ctx, dir)
+		parentID, err = f.ensureFolderPath(ctx, dir)
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		parentID = f.rootID
 	}
 
 	fileEntries, err := f.listEntries(ctx, parentID, "")
@@ -509,16 +410,14 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	dir := path.Dir(remote)
 	name := path.Base(remote)
 
-	var parentID *int64
+	var parentID *int64 = nil // Start from root
 	var err error
 
 	if dir != "." && dir != "" {
-		parentID, err = f.findFolderByPath(ctx, dir)
+		parentID, err = f.ensureFolderPath(ctx, dir)
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		parentID = f.rootID
 	}
 
 	entries, err := f.listEntries(ctx, parentID, "")
@@ -546,13 +445,17 @@ func (f *Fs) Remove(ctx context.Context, remote string) error {
 
 // Rmdir removes a directory
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	parentID, err := f.findFolderByPath(ctx, dir)
+	if dir == "" {
+		return fmt.Errorf("cannot remove root directory")
+	}
+
+	parentID, err := f.ensureFolderPath(ctx, dir)
 	if err != nil {
 		return err
 	}
 
 	if parentID == nil {
-		return fmt.Errorf("cannot remove root directory")
+		return fmt.Errorf("directory not found")
 	}
 
 	payload := map[string]interface{}{
