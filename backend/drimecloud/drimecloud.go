@@ -168,10 +168,9 @@ func (f *Fs) Features() *fs.Features {
 		DoubleSlash:              false, // No indication of special double slash handling
 
 		// TODO:
-
-		// Copy:       f.copy,       // Drime has duplicate endpoint
-		// Move:       f.move,       // Drime has move endpoint
-		// DirMove:    f.dirMove,    // Can move folders too
+		// Copy: f.Copy
+		Move:    f.Move, // Drime has move endpoint
+		DirMove: f.DirMove,
 		// PublicLink: f.publicLink, // Has shareable links API
 		// PutStream:  f.putStream,  // Upload endpoint can handle streams
 		// CleanUp:    f.cleanUp,    // Has restore from trash functionality
@@ -226,6 +225,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
 	remote := src.Remote()
+	fullPath := path.Join(f.root, remote)
 
 	// Read the content
 	content, err := io.ReadAll(in)
@@ -234,10 +234,10 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 	}
 
 	// Create folder structure if needed
-	dir := path.Dir(remote)
+	dir := path.Dir(fullPath)
 	var parentID *int64 = nil // Start from root
 	if dir != "." && dir != "" {
-		parentID, err = f.ensureFolderPath(ctx, dir)
+		parentID, err = f.getRemoteFolderId(ctx, dir, true)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create folder structure: %w", err)
 		}
@@ -248,7 +248,7 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 	writer := multipart.NewWriter(&body)
 
 	// Add file content
-	fileWriter, err := writer.CreateFormFile("file", path.Base(remote))
+	fileWriter, err := writer.CreateFormFile("file", path.Base(fullPath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create form file: %w", err)
 	}
@@ -272,6 +272,8 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 	}
 
 	// Make the API call
+	fs.Debugf(f, "Upload request: parentID=%v, filename=%q, fullPath=%q",
+		parentID, path.Base(fullPath), fullPath)
 	resp, err := f.client.Call(ctx, &rest.Opts{
 		Method: "POST",
 		Path:   "/uploads",
@@ -302,43 +304,59 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 	}
 
 	return &Object{
-		fs:    f,
-		entry: *response.FileEntry,
+		fs:       f,
+		entry:    *response.FileEntry,
+		fullPath: remote, // Keep the original remote path for the object
 	}, nil
 }
 
-// ensureFolderPath creates folder structure and returns the final folder ID
-func (f *Fs) ensureFolderPath(ctx context.Context, folderPath string) (*int64, error) {
+// getRemoteFolderId creates folder structure and returns the final folder ID
+func (f *Fs) getRemoteFolderId(ctx context.Context, folderPath string, create bool) (*int64, error) {
+	folderPath = strings.Trim(folderPath, "/")
 	if folderPath == "" || folderPath == "." {
 		return nil, nil // Root is always null
 	}
 
 	parts := strings.Split(strings.Trim(folderPath, "/"), "/")
 	var currentParentID *int64 = nil // Always start from root (null)
-
 	for _, part := range parts {
+		fs.Debugf(f, "Processing folder part: %q, currentParentID: %v", part, currentParentID)
+
 		// Check if folder already exists
 		entries, err := f.listEntries(ctx, currentParentID, "folder")
 		if err != nil {
 			return nil, err
 		}
 
+		fs.Debugf(f, "Found %d folder entries in parent %v", len(entries), currentParentID)
+
 		found := false
 		for _, entry := range entries {
+			fs.Debugf(f, "Checking entry: name=%q, type=%q, id=%d", entry.Name, entry.Type, entry.ID)
 			if entry.Name == part && entry.Type == "folder" {
 				currentParentID = &entry.ID
 				found = true
+				fs.Debugf(f, "Found existing folder %q with ID %d", part, entry.ID)
 				break
 			}
 		}
 
 		if !found {
+			if !create {
+				// Don't create - return error that folder doesn't exist
+				return nil, fmt.Errorf("folder %q not found in path %q", part, folderPath)
+			}
+
+			fs.Debugf(f, "Folder %q not found, creating new folder with parentID %v", part, currentParentID)
 			// Create folder
 			folderID, err := f.createFolder(ctx, part, currentParentID)
 			if err != nil {
 				return nil, err
 			}
 			currentParentID = folderID
+			fs.Debugf(f, "Created folder %q with ID %d", part, *folderID)
+		} else {
+			fs.Debugf(f, "Using existing folder %q with ID %d", part, *currentParentID)
 		}
 	}
 
@@ -353,6 +371,8 @@ func (f *Fs) createFolder(ctx context.Context, name string, parentID *int64) (*i
 	if parentID != nil {
 		payload["parentId"] = *parentID
 	}
+
+	fs.Debugf(f, "Request to /folders with the following payload: name=%q, parentId=%v", name, parentID)
 
 	var response APIResponse
 	_, err := f.client.CallJSON(ctx, &rest.Opts{
@@ -373,17 +393,19 @@ func (f *Fs) createFolder(ctx context.Context, name string, parentID *int64) (*i
 
 // Mkdir creates a directory
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	_, err := f.ensureFolderPath(ctx, dir)
+	fullPath := path.Join(f.root, dir)
+	fs.Debugf(f, "Mkdir folder part: %q, fullPath: %q", dir, fullPath)
+	_, err := f.getRemoteFolderId(ctx, fullPath, true)
 	return err
 }
 
 // List lists the objects and directories in dir
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	var parentID *int64 = nil // Start from root
+	fullPath := path.Join(f.root, dir)
+	var parentID *int64 = nil
 
-	// If we have a directory path, traverse to find its ID
-	if dir != "" {
-		parentID, err = f.ensureFolderPath(ctx, dir)
+	if fullPath != "" {
+		parentID, err = f.getRemoteFolderId(ctx, fullPath, false)
 		if err != nil {
 			return nil, err
 		}
@@ -398,7 +420,19 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		if entry.Type == "folder" {
 			entries = append(entries, fs.NewDir(entry.Name, time.Time{}))
 		} else {
-			entries = append(entries, &Object{fs: f, entry: entry})
+			// Construct full path relative to the filesystem root
+			var relativePath string
+			if dir == "" {
+				relativePath = entry.Name
+			} else {
+				relativePath = path.Join(dir, entry.Name)
+			}
+
+			entries = append(entries, &Object{
+				fs:       f,
+				entry:    entry,
+				fullPath: relativePath, // Relative to f.root
+			})
 		}
 	}
 
@@ -407,14 +441,15 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 // NewObject finds the Object at remote
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	dir := path.Dir(remote)
-	name := path.Base(remote)
+	fullPath := path.Join(f.root, remote)
+	dir := path.Dir(fullPath)
+	name := path.Base(fullPath)
 
-	var parentID *int64 = nil // Start from root
+	var parentID *int64 = nil
 	var err error
 
 	if dir != "." && dir != "" {
-		parentID, err = f.ensureFolderPath(ctx, dir)
+		parentID, err = f.getRemoteFolderId(ctx, dir, false)
 		if err != nil {
 			return nil, err
 		}
@@ -427,7 +462,11 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	for _, entry := range entries {
 		if entry.Name == name && entry.Type != "folder" {
-			return &Object{fs: f, entry: entry}, nil
+			return &Object{
+				fs:       f,
+				entry:    entry,
+				fullPath: remote, // Use the requested remote path
+			}, nil
 		}
 	}
 
@@ -445,11 +484,12 @@ func (f *Fs) Remove(ctx context.Context, remote string) error {
 
 // Rmdir removes a directory
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
-	if dir == "" {
+	fullPath := path.Join(f.root, dir)
+	if fullPath == "" {
 		return fmt.Errorf("cannot remove root directory")
 	}
 
-	parentID, err := f.ensureFolderPath(ctx, dir)
+	parentID, err := f.getRemoteFolderId(ctx, fullPath, false)
 	if err != nil {
 		return err
 	}
@@ -460,7 +500,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 	payload := map[string]interface{}{
 		"entryIds":      []string{strconv.FormatInt(*parentID, 10)},
-		"deleteForever": true,
+		"deleteForever": false,
 	}
 
 	var response APIResponse
@@ -482,8 +522,9 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // Object represents a file in Drime
 type Object struct {
-	fs    *Fs
-	entry FileEntry
+	fs       *Fs
+	entry    FileEntry
+	fullPath string
 }
 
 // Fs returns the parent Fs
@@ -493,7 +534,7 @@ func (o *Object) Fs() fs.Info {
 
 // Remote returns the remote path
 func (o *Object) Remote() string {
-	return o.entry.Name
+	return o.fullPath //o.entry.Name
 }
 
 // Hash returns the hash of an object
@@ -518,6 +559,10 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 		}
 	}
 	return time.Time{} // Return zero time if parsing fails
+}
+
+func (o *Object) ID() string {
+	return strconv.FormatInt(o.entry.ID, 10)
 }
 
 // SetModTime sets the modification time of the local fs object
@@ -566,6 +611,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 
 // Remove removes this object
 func (o *Object) Remove(ctx context.Context) error {
+
+	fs.Debugf(o, "Removing file: ID=%d, Path=%s", o.entry.ID, o.fullPath)
+
 	payload := map[string]interface{}{
 		"entryIds":      []string{strconv.FormatInt(o.entry.ID, 10)},
 		"deleteForever": true,
@@ -586,4 +634,101 @@ func (o *Object) Remove(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (f *Fs) moveEntries(ctx context.Context, entryIDs []int64, destParentID *int64) ([]FileEntry, error) {
+	// Prepare move request
+	payload := map[string]interface{}{
+		"entryIds": entryIDs,
+	}
+
+	// Set destination parent ID (null for root)
+	if destParentID != nil {
+		payload["destinationId"] = *destParentID
+	} else {
+		payload["destinationId"] = nil
+	}
+
+	// Make the move API call
+	var response struct {
+		Status  string      `json:"status"`
+		Message string      `json:"message,omitempty"`
+		Entries []FileEntry `json:"entries,omitempty"`
+	}
+
+	_, err := f.client.CallJSON(ctx, &rest.Opts{
+		Method: "PUT",
+		Path:   "/file-entries/move",
+	}, &payload, &response)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to move entries: %w", err)
+	}
+
+	if response.Status != "success" {
+		return nil, fmt.Errorf("move failed: %s", response.Message)
+	}
+
+	return response.Entries, nil
+}
+
+// Move moves a file from src to dst
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		return nil, fs.ErrorCantMove
+	}
+
+	fullPath := path.Join(f.root, remote)
+	dir := path.Dir(fullPath)
+
+	var destFolderID *int64 = nil
+	if dir != "" && dir != "." {
+		dirObj, err := f.NewObject(ctx, dir)
+		if err != nil {
+			return nil, fmt.Errorf("destination directory doesn't exist: %s (%w)", dir, err)
+		}
+		destFolderID = &dirObj.(*Object).entry.ID
+	}
+
+	// Move the entry
+	movedEntries, err := f.moveEntries(ctx, []int64{srcObj.entry.ID}, destFolderID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Object{
+		fs:       f,
+		entry:    movedEntries[0],
+		fullPath: remote,
+	}, nil
+}
+
+// DirMove moves a directory from src to dst
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	srcFs, ok := src.(*Fs)
+	if !ok {
+		return fs.ErrorCantDirMove
+	}
+
+	// Get source directory with full path
+	srcFullPath := path.Join(srcFs.root, srcRemote)
+	srcDirObj, err := srcFs.NewObject(ctx, srcFullPath)
+	if err != nil {
+		return fmt.Errorf("source directory not found: %w", err)
+	}
+
+	// Get destination parent directory with full path
+	dstFullPath := path.Join(f.root, dstRemote)
+	dir := path.Dir(dstFullPath)
+	dirObj, err := f.NewObject(ctx, dir)
+	if err != nil {
+		return fmt.Errorf("destination directory doesn't exist: %s (%w)", dir, err)
+	}
+
+	destParentID := &dirObj.(*Object).entry.ID
+
+	// Move the directory
+	_, err = f.moveEntries(ctx, []int64{srcDirObj.(*Object).entry.ID}, destParentID)
+	return err
 }
