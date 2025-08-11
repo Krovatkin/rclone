@@ -537,7 +537,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 	for _, entry := range fileEntries {
 		if entry.Type == "folder" {
-			entries = append(entries, fs.NewDir(entry.Name, time.Time{}))
+			entries = append(entries, fs.NewDir(path.Join(dir, entry.Name), time.Time{}))
 		} else {
 			// Construct full path relative to the filesystem root
 			var relativePath string
