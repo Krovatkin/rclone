@@ -110,17 +110,17 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		rootID: nil, // Always start with null root_id
 	}
 
-	entry, err := f.getOrCreateFileEntry(ctx, root, true)
+	// entry, err := f.getOrCreateFileEntry(ctx, root, true)
 
-	if err != nil {
-		return nil, fmt.Errorf("couldn't identify the type of root: %w", err)
-	}
+	// if err != nil {
+	// 	return nil, fmt.Errorf("couldn't identify the type of root: %w", err)
+	// }
 
-	if entry != nil && entry.Type != "folder" {
-		rootDir := path.Dir(root)
-		fs.Debugf(f, "Setting root to %q", rootDir)
-		f.root = path.Dir(root)
-	}
+	// if entry != nil && entry.Type != "folder" {
+	// 	rootDir := path.Dir(root)
+	// 	fs.Debugf(f, "Setting root to %q", rootDir)
+	// 	f.root = path.Dir(root)
+	// }
 
 	return f, nil
 }
@@ -368,7 +368,7 @@ func (f *Fs) getOrCreateFileEntry(ctx context.Context, entryPath string, create 
 		} else {
 			// Entry not found
 			if !create {
-				return nil, fmt.Errorf("entry %q not found in path %q", part, entryPath)
+				return nil, fs.ErrorDirNotFound
 			}
 
 			fs.Debugf(f, "Entry %q not found, creating new folder with parentID %v", part, parentID)
@@ -506,10 +506,16 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 // List lists the objects and directories in dir
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	fullPath := path.Join(f.root, dir)
+
 	var parentID *int64 = nil
 
 	if fullPath != "" {
 		parentEntry, err := f.getOrCreateFileEntry(ctx, fullPath, false)
+
+		if parentEntry.Type != "folder" {
+			return nil, fs.ErrorIsFile
+		}
+
 		parentID = &parentEntry.ID
 		if err != nil {
 			return nil, err
@@ -571,7 +577,12 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	for _, entry := range entries {
 
-		if entry.Name == name && entry.Type != "folder" {
+		if entry.Name == name {
+
+			if entry.Type == "folder" {
+				return nil, fs.ErrorIsDir
+			}
+
 			fs.Debugf(f, "Successfully found object %q (%d)", name, entry.ID)
 			return &Object{
 				fs:       f,
@@ -610,7 +621,11 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 
 	if parentID == nil {
-		return fmt.Errorf("directory not found")
+		return fmt.Errorf("can't remove root")
+	}
+
+	if parentEntry.Type != "folder" {
+		return fs.ErrorIsFile
 	}
 
 	payload := map[string]interface{}{
@@ -795,6 +810,8 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if !ok {
 		return nil, fs.ErrorCantMove
 	}
+
+	fs.Debugf(f, "In Move srcObj.fullPath = %q remote = %q", srcObj.fullPath, remote)
 
 	fullPath := path.Join(f.root, remote)
 	dir := path.Dir(fullPath)
