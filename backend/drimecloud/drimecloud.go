@@ -113,7 +113,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	entry, err := f.getOrCreateFileEntry(ctx, root, true)
 
 	if err == nil {
-		if entry.Type != "folder" {
+		if entry != nil && entry.Type != "folder" {
 			f.root = path.Dir(f.root)
 			return f, fs.ErrorIsFile
 		}
