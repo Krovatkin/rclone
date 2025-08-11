@@ -795,7 +795,7 @@ func (f *Fs) moveEntries(ctx context.Context, entryIDs []int64, destParentID *in
 	}
 
 	_, err := f.client.CallJSON(ctx, &rest.Opts{
-		Method: "PUT",
+		Method: "POST",
 		Path:   "/file-entries/move",
 	}, &payload, &response)
 
@@ -839,22 +839,26 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Move the entry
-	movedEntries, err := f.moveEntries(ctx, []int64{srcObj.entry.ID}, destFolderID)
+	// DRIME API borked, moveEntries returns an empty list
+	_, err := f.moveEntries(ctx, []int64{srcObj.entry.ID}, destFolderID)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Object{
-		fs:       f,
-		entry:    movedEntries[0],
-		fullPath: remote,
-	}, nil
+	return f.NewObject(ctx, remote)
+
+	// DRIME API borked because moveEntries
+	// return &Object{
+	// 	fs:       f,
+	// 	entry:    movedEntries[0],
+	// 	fullPath: remote,
+	// }, nil
 }
 
 // DirMove moves a directory from src to dst
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
 
-	fs.Debugf(f, "In Move DirMove %q", dstRemote)
+	fs.Debugf(f, "In Move DirMove: %q", dstRemote)
 	srcFs, ok := src.(*Fs)
 	if !ok {
 		return fs.ErrorCantDirMove
@@ -862,22 +866,43 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 	// Get source directory with full path
 	srcFullPath := path.Join(srcFs.root, srcRemote)
-	srcDirObj, err := srcFs.NewObject(ctx, srcFullPath)
-	if err != nil {
-		return fmt.Errorf("source directory not found: %w", err)
+
+	if srcFullPath == "" {
+		return fmt.Errorf("can't move the root folder")
+	}
+
+	srcEntry, srcErr := srcFs.getOrCreateFileEntry(ctx, srcFullPath, false)
+
+	if srcErr != nil {
+		return srcErr
+	}
+
+	if srcEntry == nil {
+		return fmt.Errorf("internal error: can't move the root folder")
+	}
+
+	if srcEntry.Type != "folder" {
+		return fs.ErrorIsFile
 	}
 
 	// Get destination parent directory with full path
 	dstFullPath := path.Join(f.root, dstRemote)
-	dir := path.Dir(dstFullPath)
-	dirObj, err := f.NewObject(ctx, dir)
-	if err != nil {
-		return fmt.Errorf("destination directory doesn't exist: %s (%w)", dir, err)
+	dstEntry, dstErr := f.getOrCreateFileEntry(ctx, dstFullPath, true)
+
+	if dstErr != nil {
+		return dstErr
 	}
 
-	destParentID := &dirObj.(*Object).entry.ID
+	var dstParentID *int64 = nil
+
+	if dstEntry != nil {
+		if dstEntry.Type != "folder" {
+			return fs.ErrorIsFile
+		}
+		dstParentID = &dstEntry.ID
+	}
 
 	// Move the directory
-	_, err = f.moveEntries(ctx, []int64{srcDirObj.(*Object).entry.ID}, destParentID)
-	return err
+	_, moveErr := f.moveEntries(ctx, []int64{srcEntry.ID}, dstParentID)
+	return moveErr
 }
