@@ -110,7 +110,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		rootID: nil, // Always start with null root_id
 	}
 
-	// entry, err := f.getOrCreateFileEntry(ctx, root, true)
+	entry, err := f.getOrCreateFileEntry(ctx, root, true)
+
+	if err == nil {
+		if entry.Type != "folder" {
+			f.root = path.Dir(f.root)
+			return f, fs.ErrorIsFile
+		}
+	}
 
 	// if err != nil {
 	// 	return nil, fmt.Errorf("couldn't identify the type of root: %w", err)
@@ -506,6 +513,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 // List lists the objects and directories in dir
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	fullPath := path.Join(f.root, dir)
+	fs.Debugf(f, "In List: dir = %q , fullPath = %q", dir, fullPath)
 
 	var parentID *int64 = nil
 
@@ -553,7 +561,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // NewObject finds the Object at remote
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	fullPath := path.Join(f.root, remote)
-	fs.Debugf(f, "NewObject fullPath %q", fullPath)
+	fs.Debugf(f, "In NewObject: remote = %q, fullPath = %q", fullPath)
 	dir := path.Dir(fullPath)
 	name := path.Base(fullPath)
 
