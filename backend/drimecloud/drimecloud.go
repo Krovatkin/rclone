@@ -213,6 +213,59 @@ type PaginatedResponse struct {
 }
 
 // listEntries lists entries in a folder
+// func (f *Fs) listEntries(ctx context.Context, parentID *int64, entryType string) ([]FileEntry, error) {
+// 	var allEntries []FileEntry
+
+// 	// First, make an initial request to get the last_page value
+// 	params := url.Values{}
+// 	params.Set("perPage", "1000") // Use reasonable page size
+// 	params.Set("page", "1")
+
+// 	if parentID != nil {
+// 		params.Set("parentIds", strconv.FormatInt(*parentID, 10))
+// 	}
+
+// 	if entryType != "" {
+// 		params.Set("type", entryType)
+// 	}
+
+// 	var initialResponse PaginatedResponse
+// 	_, err := f.client.CallJSON(ctx, &rest.Opts{
+// 		Method:     "GET",
+// 		Path:       "/drive/file-entries",
+// 		Parameters: params,
+// 	}, nil, &initialResponse)
+
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	// Add first page data
+// 	allEntries = append(allEntries, initialResponse.Data...)
+
+// 	// Now loop through all remaining pages
+// 	for i := 2; i <= initialResponse.LastPage; i++ {
+// 		params.Set("page", strconv.Itoa(i))
+
+// 		var response PaginatedResponse
+// 		_, err := f.client.CallJSON(ctx, &rest.Opts{
+// 			Method:     "GET",
+// 			Path:       "/drive/file-entries",
+// 			Parameters: params,
+// 		}, nil, &response)
+
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		// Append this page's data to our collection
+// 		allEntries = append(allEntries, response.Data...)
+// 	}
+
+// 	return allEntries, nil
+// }
+
+// listEntries lists entries in a folder
 func (f *Fs) listEntries(ctx context.Context, parentID *int64, entryType string) ([]FileEntry, error) {
 	params := url.Values{}
 	params.Set("perPage", "10000") // Increased to handle more entries
@@ -643,8 +696,8 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 	var response APIResponse
 	_, err = f.client.CallJSON(ctx, &rest.Opts{
-		Method: "DELETE",
-		Path:   "/file-entries",
+		Method: "POST",
+		Path:   "/file-entries/delete",
 	}, &payload, &response)
 
 	if err != nil {
@@ -759,7 +812,7 @@ func (o *Object) Remove(ctx context.Context) error {
 
 	var response APIResponse
 	_, err := o.fs.client.CallJSON(ctx, &rest.Opts{
-		Method: "DELETE",
+		Method: "POST",
 		Path:   "/file-entries",
 	}, &payload, &response)
 
