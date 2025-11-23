@@ -196,9 +196,10 @@ jobs:
         uses: actions/upload-artifact@v4
         if: matrix.deploy
         with:
-          name: rclone-${{ matrix.job_name }}
+          name: rclone-${{ matrix.job_name }}-${{ matrix.os }}
           path: |
-            build/**/*
+            rclone
+            rclone.exe
           retention-days: 7
 
       - name: Deploy built binaries
