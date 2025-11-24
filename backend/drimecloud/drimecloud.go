@@ -32,6 +32,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/lib/dircache"
+	"github.com/rclone/rclone/lib/kv"
 	"github.com/rclone/rclone/lib/rest"
 )
 
@@ -42,8 +43,11 @@ const (
 
 // Options defines the configuration for the backend.
 type Options struct {
-	AuthToken    string               `config:"auth_token"`
-	UploadCutoff fs.SizeSuffix        `config:"upload_cutoff"`
+	AuthToken        string          `config:"auth_token"`
+	UploadCutoff     fs.SizeSuffix   `config:"upload_cutoff"`
+	UseLocalMetadata bool            `config:"use_local_metadata"`
+	MetadataDbPath   string          `config:"metadata_db_path"`
+	MetadataHashes   fs.CommaSepList `config:"metadata_hashes"`
 }
 
 // Register the backend with rclone
@@ -58,6 +62,24 @@ func init() {
 				Name:     "upload_cutoff",
 				Help:     "Cutoff for switching to multipart upload (minimum 5 MB)",
 				Default:  fs.SizeSuffix(25 * 1024 * 1024), // 25 MB
+				Advanced: true,
+			},
+			{
+				Name:     "use_local_metadata",
+				Help:     "Store file hashes and modification times in local database for incremental sync",
+				Default:  false,
+				Advanced: false,
+			},
+			{
+				Name:     "metadata_db_path",
+				Help:     "Path to metadata database (empty for automatic: ~/.cache/rclone/kv/<remote>~drimecloud.bolt)",
+				Default:  "",
+				Advanced: true,
+			},
+			{
+				Name:     "metadata_hashes",
+				Help:     "Comma separated list of hashes to calculate and store (md5, sha256, sha1)",
+				Default:  fs.CommaSepList{"md5", "sha256"},
 				Advanced: true,
 			},
 		},
@@ -120,6 +142,7 @@ type Fs struct {
 	opt      Options
 	client   *rest.Client
 	dirCache *dircache.DirCache
+	db       *kv.DB // metadata database (nil if disabled)
 }
 
 // NewFs constructs a new filesystem instance
@@ -149,6 +172,16 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Initialize directory cache
 	// Empty string ("") is the true root ID (represents parentID = nil in the API)
 	f.dirCache = dircache.New(root, "", f)
+
+	// Initialize metadata database if enabled
+	if opt.UseLocalMetadata {
+		db, err := kv.Start(ctx, "drimecloud", f)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize metadata database: %w", err)
+		}
+		f.db = db
+		fs.Debugf(f, "Local metadata database enabled")
+	}
 
 	// If root is empty, we're at the API root - no need to validate
 	if root == "" {
@@ -217,6 +250,21 @@ func (f *Fs) Precision() time.Duration {
 
 // Hashes returns the supported hash sets
 func (f *Fs) Hashes() hash.Set {
+	if f.db != nil {
+		// Parse configured hash types from metadata_hashes option
+		hashSet := hash.NewHashSet()
+		for _, hashName := range f.opt.MetadataHashes {
+			switch strings.ToLower(hashName) {
+			case "md5":
+				hashSet.Add(hash.MD5)
+			case "sha1":
+				hashSet.Add(hash.SHA1)
+			case "sha256":
+				hashSet.Add(hash.SHA256)
+			}
+		}
+		return hashSet
+	}
 	return hash.Set(hash.None)
 }
 
@@ -260,6 +308,15 @@ func (f *Fs) Features() *fs.Features {
 		// PutStream:  f.putStream,  // Upload endpoint can handle streams
 		// CleanUp:    f.cleanUp,    // Has restore from trash functionality
 	}
+}
+
+// Shutdown is called when rclone is shutting down
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.db != nil {
+		fs.Debugf(f, "Closing metadata database")
+		return f.db.Stop(false) // false = don't remove the database file
+	}
+	return nil
 }
 
 // FindLeaf finds a directory entry (leaf) in a parent directory (pathID)
@@ -453,6 +510,22 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, isUpdate 
 func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) (fs.Object, error) {
 	remote := src.Remote()
 
+	// Calculate hashes if metadata DB is enabled
+	var hasher *hash.MultiHasher
+	if f.db != nil {
+		hashSet := f.Hashes()
+		if hashSet != hash.Set(hash.None) {
+			var err error
+			hasher, err = hash.NewMultiHasherTypes(hashSet)
+			if err != nil {
+				fs.Debugf(f, "Failed to create hasher: %v", err)
+			} else {
+				// Wrap input with hash calculation
+				in = io.TeeReader(in, hasher)
+			}
+		}
+	}
+
 	// Read the content
 	content, err := io.ReadAll(in)
 	if err != nil {
@@ -543,6 +616,26 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 		fullPath: remote, // Keep the original remote path for the object
 	}
 
+	// Store metadata in DB if enabled and hashes were calculated
+	if f.db != nil && hasher != nil {
+		hashes := make(map[string]string)
+		for hashType, hashValue := range hasher.Sums() {
+			hashes[hashType.String()] = hashValue
+		}
+
+		record := NewMetadataRecord(src.Size(), src.ModTime(ctx), hashes)
+		record.EntryID = response.FileEntry.ID
+		record.Hash = response.FileEntry.Hash
+		record.UpdatedAt = response.FileEntry.UpdatedAt
+
+		if err := putMetadata(ctx, f.db, remote, record); err != nil {
+			fs.Debugf(f, "Failed to store metadata: %v", err)
+			// Don't fail the upload if metadata storage fails
+		} else {
+			fs.Debugf(f, "Stored metadata for %s with hashes: %v", remote, hashes)
+		}
+	}
+
 	// Drime doesn't allow updating any metadata
 	/*
 	// Preserve the source file's modification time
@@ -563,6 +656,22 @@ func (f *Fs) uploadMultipart(ctx context.Context, in io.Reader, src fs.ObjectInf
 	fileName := path.Base(remote)
 
 	fs.Debugf(f, "Starting multipart upload for %s (size: %d)", fileName, size)
+
+	// Calculate hashes if metadata DB is enabled
+	var hasher *hash.MultiHasher
+	if f.db != nil {
+		hashSet := f.Hashes()
+		if hashSet != hash.Set(hash.None) {
+			var err error
+			hasher, err = hash.NewMultiHasherTypes(hashSet)
+			if err != nil {
+				fs.Debugf(f, "Failed to create hasher: %v", err)
+			} else {
+				// Wrap input with hash calculation
+				in = io.TeeReader(in, hasher)
+			}
+		}
+	}
 
 	// Detect MIME type from filename
 	mimeType := fs.MimeTypeFromName(remote)
@@ -731,6 +840,26 @@ func (f *Fs) uploadMultipart(ctx context.Context, in io.Reader, src fs.ObjectInf
 		fs:       f,
 		entry:    *entryResp.FileEntry,
 		fullPath: remote,
+	}
+
+	// Store metadata in DB if enabled and hashes were calculated
+	if f.db != nil && hasher != nil {
+		hashes := make(map[string]string)
+		for hashType, hashValue := range hasher.Sums() {
+			hashes[hashType.String()] = hashValue
+		}
+
+		record := NewMetadataRecord(src.Size(), src.ModTime(ctx), hashes)
+		record.EntryID = entryResp.FileEntry.ID
+		record.Hash = entryResp.FileEntry.Hash
+		record.UpdatedAt = entryResp.FileEntry.UpdatedAt
+
+		if err := putMetadata(ctx, f.db, remote, record); err != nil {
+			fs.Debugf(f, "Failed to store metadata: %v", err)
+			// Don't fail the upload if metadata storage fails
+		} else {
+			fs.Debugf(f, "Stored metadata for %s with hashes: %v", remote, hashes)
+		}
 	}
 
 	// Drime doesn't allow updating any metadata
@@ -956,7 +1085,39 @@ func (o *Object) Remote() string {
 
 // Hash returns the hash of an object
 func (o *Object) Hash(ctx context.Context, ht hash.Type) (string, error) {
-	return "", hash.ErrUnsupported
+	// If metadata DB is not enabled, return unsupported
+	if o.fs.db == nil {
+		return "", hash.ErrUnsupported
+	}
+
+	// Try to get metadata from DB
+	record, err := getMetadata(ctx, o.fs.db, o.Remote())
+	if err != nil {
+		// Metadata not found - return unsupported
+		return "", hash.ErrUnsupported
+	}
+
+	// Validate fingerprint (size + modtime)
+	if record.Size != o.Size() {
+		fs.Debugf(o.fs, "Hash cache miss for %s: size mismatch (%d != %d)", o.Remote(), record.Size, o.Size())
+		return "", hash.ErrUnsupported
+	}
+
+	currentModTime := o.ModTime(ctx)
+	if !record.ModTime.Equal(currentModTime) {
+		fs.Debugf(o.fs, "Hash cache miss for %s: modtime mismatch", o.Remote())
+		return "", hash.ErrUnsupported
+	}
+
+	// Get hash from cache
+	hashValue := record.Hashes[ht.String()]
+	if hashValue == "" {
+		// This hash type wasn't calculated
+		return "", hash.ErrUnsupported
+	}
+
+	fs.Debugf(o.fs, "Hash cache hit for %s: %s = %s", o.Remote(), ht.String(), hashValue)
+	return hashValue, nil
 }
 
 // Size returns the size of an object in bytes
@@ -970,6 +1131,19 @@ func (o *Object) String() string {
 
 // ModTime returns the modification time of the object
 func (o *Object) ModTime(ctx context.Context) time.Time {
+	// If metadata DB is enabled, check there first for preserved modtime
+	if o.fs.db != nil {
+		record, err := getMetadata(ctx, o.fs.db, o.Remote())
+		if err == nil {
+			// Validate fingerprint
+			if record.Size == o.Size() {
+				fs.Debugf(o.fs, "ModTime from DB for %s: %v", o.Remote(), record.ModTime)
+				return record.ModTime
+			}
+		}
+	}
+
+	// Fall back to API's UpdatedAt timestamp
 	if o.entry.UpdatedAt != "" {
 		if t, err := time.Parse(time.RFC3339, o.entry.UpdatedAt); err == nil {
 			return t
@@ -984,42 +1158,34 @@ func (o *Object) ID() string {
 
 // SetModTime sets the modification time of the file
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
-	// Drime API does not support updating file metadata via PUT /file-entries/{id}
-	// Attempts to set created_at, updated_at, or other fields return 500 Internal Server Error
-	// These fields are auto-managed by the database on the server side
-	return fs.ErrorCantSetModTime
+	// Drime API's PUT /file-entries/{id} endpoint has duplicate name validation
+	// that prevents updating a file's metadata without renaming it.
+	// Therefore, we store the modtime in the local metadata database instead.
 
-	// Code below is commented out - does not work with Drime API:
-	/*
-	// Format time as RFC3339 to match API format
-	timestamp := modTime.Format(time.RFC3339)
-
-	// Try to set created_at instead of updated_at
-	// (updated_at is likely auto-managed by the database)
-	payload := map[string]interface{}{
-		"created_at": timestamp,
+	if o.fs.db == nil {
+		return fs.ErrorCantSetModTime
 	}
 
-	var response APIResponse
-	_, err := o.fs.client.CallJSON(ctx, &rest.Opts{
-		Method: "PUT",
-		Path:   fmt.Sprintf("/file-entries/%d", o.entry.ID),
-	}, &payload, &response)
-
+	// Get existing metadata or create new record
+	record, err := getMetadata(ctx, o.fs.db, o.Remote())
 	if err != nil {
-		return fmt.Errorf("failed to set modtime: %w", err)
+		// Create new metadata record
+		record = NewMetadataRecord(o.Size(), modTime, nil)
+		record.EntryID = o.entry.ID
+		record.Hash = o.entry.Hash
+		record.UpdatedAt = o.entry.UpdatedAt
+	} else {
+		// Update existing record's modtime
+		record.ModTime = modTime
 	}
 
-	if response.Status != "success" {
-		return fmt.Errorf("failed to set modtime: %s", response.Message)
+	// Store updated metadata
+	if err := putMetadata(ctx, o.fs.db, o.Remote(), record); err != nil {
+		return fmt.Errorf("failed to store modtime in metadata DB: %w", err)
 	}
 
-	// Update our cached entries
-	o.entry.CreatedAt = timestamp
-	o.entry.UpdatedAt = timestamp
-
+	fs.Debugf(o.fs, "Set modtime in metadata DB for %s: %v", o.Remote(), modTime)
 	return nil
-	*/
 }
 
 // Storable returns whether this object is storable
@@ -1091,6 +1257,14 @@ func (o *Object) Remove(ctx context.Context) error {
 
 	if response.Status != "success" {
 		return fmt.Errorf("failed to remove file: %s", response.Message)
+	}
+
+	// Delete metadata from DB if enabled
+	if o.fs.db != nil {
+		if err := deleteMetadata(ctx, o.fs.db, o.Remote()); err != nil {
+			fs.Debugf(o.fs, "Failed to delete metadata: %v", err)
+			// Don't fail the remove if metadata deletion fails
+		}
 	}
 
 	return nil
