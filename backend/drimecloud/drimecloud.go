@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -35,12 +36,14 @@ import (
 )
 
 const (
-	apiBaseURL = "https://app.drime.cloud/api/v1"
+	apiBaseURL      = "https://app.drime.cloud/api/v1"
+	defaultChunkSize = 25 * 1024 * 1024 // 25 MB chunks for multipart upload
 )
 
 // Options defines the configuration for the backend.
 type Options struct {
-	AuthToken string `config:"auth_token"`
+	AuthToken    string               `config:"auth_token"`
+	UploadCutoff fs.SizeSuffix        `config:"upload_cutoff"`
 }
 
 // Register the backend with rclone
@@ -51,6 +54,12 @@ func init() {
 		NewFs:       NewFs,
 		Options: []fs.Option{
 			{Name: "auth_token", Help: "Your Drime API auth token"},
+			{
+				Name:     "upload_cutoff",
+				Help:     "Cutoff for switching to multipart upload (minimum 5 MB)",
+				Default:  fs.SizeSuffix(25 * 1024 * 1024), // 25 MB
+				Advanced: true,
+			},
 		},
 	})
 }
@@ -74,6 +83,34 @@ type APIResponse struct {
 	FileEntry *FileEntry  `json:"fileEntry,omitempty"`
 	Folder    *FileEntry  `json:"folder,omitempty"`
 	Entries   []FileEntry `json:"entries,omitempty"`
+}
+
+// MultipartCreateResponse represents response from /s3/multipart/create
+type MultipartCreateResponse struct {
+	UploadID string `json:"uploadId"`
+	Key      string `json:"key"`
+}
+
+// SignedURL represents a signed URL for a part upload
+type SignedURL struct {
+	PartNumber int    `json:"partNumber"`
+	URL        string `json:"url"`
+}
+
+// MultipartSignURLsResponse represents response from /s3/multipart/batch-sign-part-urls
+type MultipartSignURLsResponse struct {
+	URLs []SignedURL `json:"urls"`
+}
+
+// MultipartPart represents a completed part for the complete request
+type MultipartPart struct {
+	PartNumber int    `json:"PartNumber"`
+	ETag       string `json:"ETag"`
+}
+
+// S3EntryResponse represents response from /s3/entries
+type S3EntryResponse struct {
+	FileEntry *FileEntry `json:"fileEntry"`
 }
 
 // Fs represents a connection to Drime storage
@@ -113,6 +150,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Empty string ("") is the true root ID (represents parentID = nil in the API)
 	f.dirCache = dircache.New(root, "", f)
 
+	// If root is empty, we're at the API root - no need to validate
+	if root == "" {
+		return f, nil
+	}
+
 	// Try to find the root directory without creating it
 	err = f.dirCache.FindRoot(ctx, false)
 	if err != nil {
@@ -128,6 +170,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if err != nil {
 			// Parent doesn't exist either
 			// This is OK - root will be created on demand when needed
+			// Reset dirCache to avoid cached failure state
+			f.dirCache = dircache.New(root, "", f)
 			return f, nil
 		}
 
@@ -135,6 +179,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		_, err := tempF.NewObject(ctx, remote)
 		if err != nil {
 			// Not a file either, return original f
+			// Reset dirCache to avoid cached failure state
+			f.dirCache = dircache.New(root, "", f)
 			return f, nil
 		}
 
@@ -249,6 +295,8 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 // CreateDir creates a new directory
 // This is the second required method for the dircache.DirCacher interface
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
+	fs.Debugf(f, "CreateDir called: pathID=%q, leaf=%q", pathID, leaf)
+
 	// Convert pathID string to *int64 for Drime API
 	var parentID *int64
 	if pathID != "" {
@@ -259,9 +307,11 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 	// Create the folder using existing helper function
 	folder, err := f.createFolder(ctx, leaf, parentID)
 	if err != nil {
+		fs.Debugf(f, "CreateDir failed: %v", err)
 		return "", err
 	}
 
+	fs.Debugf(f, "CreateDir succeeded: newID=%d", folder.ID)
 	// Return the new folder's ID as a string
 	return strconv.FormatInt(folder.ID, 10), nil
 }
@@ -269,20 +319,27 @@ func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, 
 // findDirID is a helper that finds a directory ID and converts it to *int64 for the Drime API
 // Returns nil for root directory (empty dir)
 func (f *Fs) findDirID(ctx context.Context, dir string, create bool) (*int64, error) {
-	if dir == "" {
-		return nil, nil // Root directory
-	}
+	fs.Debugf(f, "findDirID called: dir=%q, create=%v", dir, create)
 
+	// Let dirCache resolve the directory (it calls FindRoot automatically)
 	dirID, err := f.dirCache.FindDir(ctx, dir, create)
 	if err != nil {
+		fs.Debugf(f, "findDirID: FindDir returned error: %v", err)
 		return nil, err
 	}
 
+	fs.Debugf(f, "findDirID: FindDir returned dirID=%q", dirID)
+
+	// Empty dirID means true API root (parentID = nil in Drime API)
 	if dirID == "" {
-		return nil, nil // Root ID from cache
+		return nil, nil
 	}
 
-	id, _ := strconv.ParseInt(dirID, 10, 64)
+	// Parse and return the directory ID
+	id, err := strconv.ParseInt(dirID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid directory ID %q: %w", dirID, err)
+	}
 	return &id, nil
 }
 
@@ -305,7 +362,7 @@ func (f *Fs) listEntries(ctx context.Context, parentID *int64, entryType string)
 
 	// First, make an initial request to get the last_page value
 	params := url.Values{}
-	params.Set("perPage", "5") // Small page size for testing pagination
+	params.Set("perPage", "200") // Small page size for testing pagination
 	params.Set("page", "1")
 
 	if parentID != nil {
@@ -362,6 +419,34 @@ func (f *Fs) listEntries(ctx context.Context, parentID *int64, entryType string)
 
 // Put uploads a new file
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.put(ctx, in, src, false)
+}
+
+// put handles both new uploads and updates with size-based routing
+func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, isUpdate bool) (fs.Object, error) {
+	remote := src.Remote()
+	size := src.Size()
+
+	// Get parent directory ID
+	dir := path.Dir(remote)
+	if dir == "." {
+		dir = ""
+	}
+	parentID, err := f.findDirID(ctx, dir, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find parent directory: %w", err)
+	}
+
+	// Choose upload method based on size
+	// Use multipart upload if size is known and >= UploadCutoff
+	// If size is unknown (< 0), use simple upload for safety
+	if size >= 0 && size >= int64(f.opt.UploadCutoff) {
+		fs.Debugf(f, "Using multipart upload for %s (size: %d bytes >= cutoff: %d bytes)",
+			remote, size, f.opt.UploadCutoff)
+		return f.uploadMultipart(ctx, in, src, parentID)
+	}
+
+	fs.Debugf(f, "Using simple upload for %s (size: %d bytes)", remote, size)
 	return f.putUnchecked(ctx, in, src)
 }
 
@@ -453,6 +538,201 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 	}, nil
 }
 
+// uploadMultipart uploads a file using S3 multipart upload for large files
+func (f *Fs) uploadMultipart(ctx context.Context, in io.Reader, src fs.ObjectInfo, parentID *int64) (*Object, error) {
+	remote := src.Remote()
+	size := src.Size()
+	fileName := path.Base(remote)
+
+	fs.Debugf(f, "Starting multipart upload for %s (size: %d)", fileName, size)
+
+	// Step 1: Initialize multipart upload
+	initPayload := map[string]interface{}{
+		"filename":     fileName,
+		"mime":         "application/octet-stream",
+		"size":         size,
+		"extension":    strings.TrimPrefix(path.Ext(fileName), "."),
+		"relativePath": "",
+		"workspaceId":  0,
+	}
+
+	var createResp MultipartCreateResponse
+	_, err := f.client.CallJSON(ctx, &rest.Opts{
+		Method: "POST",
+		Path:   "/s3/multipart/create",
+	}, &initPayload, &createResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize multipart upload: %w", err)
+	}
+
+	uploadID := createResp.UploadID
+	key := createResp.Key
+	fs.Debugf(f, "Multipart upload initialized: uploadId=%s, key=%s", uploadID, key)
+
+	// Calculate number of parts
+	numParts := int(math.Ceil(float64(size) / float64(defaultChunkSize)))
+	fs.Debugf(f, "Will upload %d parts", numParts)
+
+	// Collect all uploaded parts
+	var uploadedParts []MultipartPart
+
+	// Step 2 & 3: Get signed URLs and upload parts
+	// For simplicity, we'll get all signed URLs at once (Python CLI does batching, but let's keep it simple)
+	partNumbers := make([]int, numParts)
+	for i := 0; i < numParts; i++ {
+		partNumbers[i] = i + 1
+	}
+
+	signPayload := map[string]interface{}{
+		"key":         key,
+		"uploadId":    uploadID,
+		"partNumbers": partNumbers,
+	}
+
+	var signResp MultipartSignURLsResponse
+	_, err = f.client.CallJSON(ctx, &rest.Opts{
+		Method: "POST",
+		Path:   "/s3/multipart/batch-sign-part-urls",
+	}, &signPayload, &signResp)
+	if err != nil {
+		// Abort the upload
+		f.abortMultipartUpload(ctx, key, uploadID)
+		return nil, fmt.Errorf("failed to get signed URLs: %w", err)
+	}
+
+	fs.Debugf(f, "Got %d signed URLs", len(signResp.URLs))
+
+	// Upload each part
+	for i, signedURL := range signResp.URLs {
+		partNum := signedURL.PartNumber
+
+		// Calculate part size
+		partSize := defaultChunkSize
+		if i == numParts-1 {
+			// Last part might be smaller
+			partSize = int(size - int64(i)*defaultChunkSize)
+		}
+
+		// Read the chunk
+		chunk := make([]byte, partSize)
+		n, err := io.ReadFull(in, chunk)
+		if err != nil && err != io.ErrUnexpectedEOF {
+			f.abortMultipartUpload(ctx, key, uploadID)
+			return nil, fmt.Errorf("failed to read chunk %d: %w", partNum, err)
+		}
+		chunk = chunk[:n]
+
+		fs.Debugf(f, "Uploading part %d/%d (%d bytes)", partNum, numParts, len(chunk))
+
+		// Upload part to R2
+		req, err := http.NewRequestWithContext(ctx, "PUT", signedURL.URL, bytes.NewReader(chunk))
+		if err != nil {
+			f.abortMultipartUpload(ctx, key, uploadID)
+			return nil, fmt.Errorf("failed to create PUT request for part %d: %w", partNum, err)
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			f.abortMultipartUpload(ctx, key, uploadID)
+			return nil, fmt.Errorf("failed to upload part %d: %w", partNum, err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			f.abortMultipartUpload(ctx, key, uploadID)
+			return nil, fmt.Errorf("failed to upload part %d: status %d: %s", partNum, resp.StatusCode, string(body))
+		}
+
+		// Get ETag from response
+		etag := resp.Header.Get("ETag")
+		etag = strings.Trim(etag, "\"")
+
+		uploadedParts = append(uploadedParts, MultipartPart{
+			PartNumber: partNum,
+			ETag:       etag,
+		})
+
+		fs.Debugf(f, "Part %d uploaded successfully (ETag: %s)", partNum, etag)
+	}
+
+	// Step 4: Complete multipart upload
+	completePayload := map[string]interface{}{
+		"key":      key,
+		"uploadId": uploadID,
+		"parts":    uploadedParts,
+	}
+
+	var completeResp map[string]interface{}
+	_, err = f.client.CallJSON(ctx, &rest.Opts{
+		Method: "POST",
+		Path:   "/s3/multipart/complete",
+	}, &completePayload, &completeResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to complete multipart upload: %w", err)
+	}
+
+	fs.Debugf(f, "Multipart upload completed")
+
+	// Step 5: Create file entry in Drime
+	entryPayload := map[string]interface{}{
+		"clientMime":      "application/octet-stream",
+		"clientName":      fileName,
+		"filename":        path.Base(key),
+		"size":            size,
+		"clientExtension": strings.TrimPrefix(path.Ext(fileName), "."),
+		"relativePath":    "",
+		"workspaceId":     0,
+	}
+
+	// Add parentId if not root
+	if parentID != nil {
+		entryPayload["parentId"] = *parentID
+	}
+
+	var entryResp S3EntryResponse
+	_, err = f.client.CallJSON(ctx, &rest.Opts{
+		Method: "POST",
+		Path:   "/s3/entries",
+	}, &entryPayload, &entryResp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create file entry: %w", err)
+	}
+
+	if entryResp.FileEntry == nil {
+		return nil, fmt.Errorf("file entry creation returned no data")
+	}
+
+	fs.Debugf(f, "File entry created: ID=%d", entryResp.FileEntry.ID)
+
+	return &Object{
+		fs:       f,
+		entry:    *entryResp.FileEntry,
+		fullPath: remote,
+	}, nil
+}
+
+// abortMultipartUpload aborts a multipart upload in case of error
+func (f *Fs) abortMultipartUpload(ctx context.Context, key, uploadID string) {
+	payload := map[string]interface{}{
+		"key":      key,
+		"uploadId": uploadID,
+	}
+
+	var resp map[string]interface{}
+	_, err := f.client.CallJSON(ctx, &rest.Opts{
+		Method: "POST",
+		Path:   "/s3/multipart/abort",
+	}, &payload, &resp)
+	if err != nil {
+		fs.Errorf(f, "Failed to abort multipart upload: %v", err)
+	} else {
+		fs.Debugf(f, "Multipart upload aborted: uploadId=%s", uploadID)
+	}
+}
+
+
 // createFolder creates a new folder and returns FileEntry
 func (f *Fs) createFolder(ctx context.Context, name string, parentID *int64) (*FileEntry, error) {
 	payload := map[string]interface{}{
@@ -494,7 +774,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	// Use dircache to find the directory ID and convert to *int64
 	parentID, err := f.findDirID(ctx, dir, false)
 	if err != nil {
-		return nil, err
+		// If directory doesn't exist, return empty list instead of error
+		// This allows copy operations to create the directory
+		fs.Debugf(f, "List: directory not found, returning empty list: %v", err)
+		return nil, nil
 	}
 
 	// List all entries in the directory
@@ -539,7 +822,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	// Use dircache to find parent directory ID and convert to *int64
 	parentID, err := f.findDirID(ctx, dir, false)
 	if err != nil {
-		return nil, err
+		// If parent directory doesn't exist, the object definitely doesn't exist
+		fs.Debugf(f, "NewObject: parent directory not found, returning ErrorObjectNotFound: %v", err)
+		return nil, fs.ErrorObjectNotFound
 	}
 
 	// List entries in parent directory
@@ -699,7 +984,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 // Update updates the object with the new content
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	newObj, err := o.fs.putUnchecked(ctx, in, src)
+	// Upload the new version
+	newObj, err := o.fs.put(ctx, in, src, true)
 	if err != nil {
 		return err
 	}
