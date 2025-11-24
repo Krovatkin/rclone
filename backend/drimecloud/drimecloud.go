@@ -227,7 +227,7 @@ func (f *Fs) Features() *fs.Features {
 		CaseInsensitive:          false, // No indication of case insensitivity in API
 		DuplicateFiles:           true,  // API allows duplicate endpoint, so likely allows duplicate names
 		ReadMimeType:             true,  // FileEntry has "mime" field (e.g., "image/png")
-		WriteMimeType:            false, // Upload endpoint doesn't allow setting mime type
+		WriteMimeType:            true,  // Upload endpoints accept mime/clientMime parameter
 		CanHaveEmptyDirectories:  true,  // Has folder creation endpoint separate from file upload
 		BucketBased:              false, // Not bucket-based, uses hierarchical folders
 		BucketBasedRootOK:        false, // Not applicable
@@ -475,12 +475,18 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 
-	// Add file content
-	fileWriter, err := writer.CreateFormFile("file", path.Base(remote))
+	// Detect MIME type from filename
+	mimeType := fs.MimeTypeFromName(remote)
+
+	// Add file content with MIME type
+	partWriter, err := writer.CreatePart(map[string][]string{
+		"Content-Disposition": {fmt.Sprintf(`form-data; name="file"; filename="%s"`, path.Base(remote))},
+		"Content-Type":        {mimeType},
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to create form file: %w", err)
+		return nil, fmt.Errorf("failed to create form part: %w", err)
 	}
-	_, err = fileWriter.Write(content)
+	_, err = partWriter.Write(content)
 	if err != nil {
 		return nil, fmt.Errorf("failed to write file content: %w", err)
 	}
@@ -531,11 +537,23 @@ func (f *Fs) putUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo) 
 		return nil, fmt.Errorf("upload failed: %s", response.Message)
 	}
 
-	return &Object{
+	obj := &Object{
 		fs:       f,
 		entry:    *response.FileEntry,
 		fullPath: remote, // Keep the original remote path for the object
-	}, nil
+	}
+
+	// Drime doesn't allow updating any metadata
+	/*
+	// Preserve the source file's modification time
+	err = obj.SetModTime(ctx, src.ModTime(ctx))
+	if err != nil {
+		fs.Debugf(f, "Failed to set modification time: %v", err)
+		// Don't fail the upload if we can't set modtime
+	}
+	*/
+
+	return obj, nil
 }
 
 // uploadMultipart uploads a file using S3 multipart upload for large files
@@ -546,10 +564,13 @@ func (f *Fs) uploadMultipart(ctx context.Context, in io.Reader, src fs.ObjectInf
 
 	fs.Debugf(f, "Starting multipart upload for %s (size: %d)", fileName, size)
 
+	// Detect MIME type from filename
+	mimeType := fs.MimeTypeFromName(remote)
+
 	// Step 1: Initialize multipart upload
 	initPayload := map[string]interface{}{
 		"filename":     fileName,
-		"mime":         "application/octet-stream",
+		"mime":         mimeType,
 		"size":         size,
 		"extension":    strings.TrimPrefix(path.Ext(fileName), "."),
 		"relativePath": "",
@@ -675,9 +696,9 @@ func (f *Fs) uploadMultipart(ctx context.Context, in io.Reader, src fs.ObjectInf
 
 	fs.Debugf(f, "Multipart upload completed")
 
-	// Step 5: Create file entry in Drime
+	// Step 5: Create file entry in Drime (use mimeType detected earlier)
 	entryPayload := map[string]interface{}{
-		"clientMime":      "application/octet-stream",
+		"clientMime":      mimeType,
 		"clientName":      fileName,
 		"filename":        path.Base(key),
 		"size":            size,
@@ -706,11 +727,23 @@ func (f *Fs) uploadMultipart(ctx context.Context, in io.Reader, src fs.ObjectInf
 
 	fs.Debugf(f, "File entry created: ID=%d", entryResp.FileEntry.ID)
 
-	return &Object{
+	obj := &Object{
 		fs:       f,
 		entry:    *entryResp.FileEntry,
 		fullPath: remote,
-	}, nil
+	}
+
+	// Drime doesn't allow updating any metadata
+	/*
+	// Preserve the source file's modification time
+	err = obj.SetModTime(ctx, src.ModTime(ctx))
+	if err != nil {
+		fs.Debugf(f, "Failed to set modification time: %v", err)
+		// Don't fail the upload if we can't set modtime
+	}
+	*/
+
+	return obj, nil
 }
 
 // abortMultipartUpload aborts a multipart upload in case of error
@@ -949,9 +982,44 @@ func (o *Object) ID() string {
 	return strconv.FormatInt(o.entry.ID, 10)
 }
 
-// SetModTime sets the modification time of the local fs object
+// SetModTime sets the modification time of the file
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
+	// Drime API does not support updating file metadata via PUT /file-entries/{id}
+	// Attempts to set created_at, updated_at, or other fields return 500 Internal Server Error
+	// These fields are auto-managed by the database on the server side
 	return fs.ErrorCantSetModTime
+
+	// Code below is commented out - does not work with Drime API:
+	/*
+	// Format time as RFC3339 to match API format
+	timestamp := modTime.Format(time.RFC3339)
+
+	// Try to set created_at instead of updated_at
+	// (updated_at is likely auto-managed by the database)
+	payload := map[string]interface{}{
+		"created_at": timestamp,
+	}
+
+	var response APIResponse
+	_, err := o.fs.client.CallJSON(ctx, &rest.Opts{
+		Method: "PUT",
+		Path:   fmt.Sprintf("/file-entries/%d", o.entry.ID),
+	}, &payload, &response)
+
+	if err != nil {
+		return fmt.Errorf("failed to set modtime: %w", err)
+	}
+
+	if response.Status != "success" {
+		return fmt.Errorf("failed to set modtime: %s", response.Message)
+	}
+
+	// Update our cached entries
+	o.entry.CreatedAt = timestamp
+	o.entry.UpdatedAt = timestamp
+
+	return nil
+	*/
 }
 
 // Storable returns whether this object is storable
